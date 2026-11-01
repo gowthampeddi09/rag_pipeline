@@ -63,6 +63,8 @@ venv.bak/
 # Qdrant Database storage
 qdrant_storage/
 vector_db/
+qdrant_local_storage/
+models_cache/
 
 # Data source ignores (optional: keep PDFs locally, don't push)
 data_source/*

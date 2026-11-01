@@ -3,6 +3,13 @@
 # Build a golden dataset, evaluate retrieval AND generation separately.
 
 import os
+import sys
+from pathlib import Path
+
+# Auto-detect and add project root to sys.path
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 from datasets import Dataset
 from ragas import evaluate
 from ragas.metrics import context_recall, context_precision, faithfulness, answer_relevancy

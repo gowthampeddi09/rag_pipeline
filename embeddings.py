@@ -2,7 +2,15 @@
 # Using FastEmbed for lightning-fast, production-ready embeddings.
 # Avoids heavy PyTorch/Transformers dependencies.
 
+import sys
 from functools import lru_cache
+from pathlib import Path
+
+# Auto-detect and add project root to sys.path
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 from fastembed import TextEmbedding, SparseTextEmbedding
 
 from common.config import get_settings

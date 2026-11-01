@@ -18,40 +18,76 @@ This pipeline is built on the following advanced technologies:
 
 ## 🚀 Getting Started
 
-### Installation
+### 1. Environment & Dependencies
+
+This pipeline is part of the `AI_Agents` workspace. A pre-configured virtual environment is located at the workspace root (`AI_Agents/.venv`).
+
+If you want to set up a new environment or install dependencies manually:
 
 ```bash
-# Clone the repository
-git clone https://github.com/gowthampeddi09/rag_pipeline.git
-cd rag_pipeline
-
-# Create a virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
+# From AI_Agents/ or rag_pipeline/ directory:
 pip install -r requirements.txt
 ```
 
-### Running the API Server
+Ensure your `.env` file exists at the root `AI_Agents/.env` with your API keys:
+```env
+GOOGLE_API_KEY=your_gemini_key
+GROQ_API_KEY=your_groq_key
+```
 
-The FastAPI server automatically handles building the knowledge base from your `data_source` directory upon startup.
+---
 
+### 2. Running the System
+
+You can run the pipeline either via the **FastAPI REST server** or directly from the **Python CLI**.
+
+#### Option A: Start the FastAPI Server (Recommended)
+
+From the project root (`AI_Agents`):
 ```bash
-# Start the server
+.\.venv\Scripts\python -m uvicorn rag_pipeline.server:app --host 0.0.0.0 --port 8000
+```
+
+Or from inside `rag_pipeline/`:
+```bash
 python server.py
 ```
-The API will be available at `http://localhost:8000`. 
-Check the health status at `http://localhost:8000/health`.
 
-### Interacting with the Pipeline
+Upon startup, the server automatically scans and indexes documents in `data_source/`.
 
-You can query the RAG system directly via the REST API:
+#### Option B: Run Directly from Python CLI
 
+To test indexing and run a query directly in your terminal:
+```bash
+python pipeline.py
+```
+
+---
+
+### 3. Accessing the API in Your Browser
+
+> ⚠️ **Important:** Do not open `http://0.0.0.0:8000/` in your browser. `0.0.0.0` is a server bind address and will return `ERR_ADDRESS_INVALID`. Always use **`localhost`** or **`127.0.0.1`**.
+
+Once the server is running, open:
+* **API Overview & Status:** [http://localhost:8000/](http://localhost:8000/)
+* **Interactive Swagger UI (Test Queries):** [http://localhost:8000/docs](http://localhost:8000/docs)
+* **Health Check Probe:** [http://localhost:8000/health](http://localhost:8000/health)
+* **Readiness Check Probe:** [http://localhost:8000/ready](http://localhost:8000/ready)
+
+---
+
+### 4. Querying via REST API
+
+#### Using PowerShell:
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8000/query" -Method Post -ContentType "application/json" -Body '{"question": "What is the key summary of the document?"}'
+```
+
+#### Using cURL:
 ```bash
 curl -X POST "http://localhost:8000/query" \
      -H "Content-Type: application/json" \
-     -d '{"question": "What is the primary function of this system?"}'
+     -d '{"question": "What is the key summary of the document?"}'
 ```
 
 ## 📁 Project Structure

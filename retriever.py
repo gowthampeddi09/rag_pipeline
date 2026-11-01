@@ -2,6 +2,14 @@
 # Hybrid retrieval: Qdrant (dense + sparse search) + FlashRank reranking.
 # This is the core retrieval engine of the RAG pipeline.
 
+import sys
+from pathlib import Path
+
+# Auto-detect and add project root to sys.path
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
@@ -9,14 +17,10 @@ from qdrant_client.models import (
     SparseVectorParams,
     SparseIndexParams,
     PointStruct,
-    NamedVector,
-    NamedSparseVector,
     SparseVector,
-    SearchRequest,
     Prefetch,
     FusionQuery,
     Fusion,
-    QueryRequest,
 )
 
 from flashrank import Ranker, RerankRequest
@@ -26,29 +30,49 @@ from common.logger import get_logger
 
 logger = get_logger(__name__)
 
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
 # Module-level singletons
 _qdrant_client: QdrantClient | None = None
 _reranker: Ranker | None = None
 
 
 def get_qdrant_client() -> QdrantClient:
-    """Returns a singleton Qdrant client. Uses in-memory mode if Qdrant server is not available."""
+    """
+    Returns a persistent Qdrant client singleton with automatic retry and local disk fallback.
+    Ensures data persists across restarts rather than losing data in memory.
+    """
     global _qdrant_client
     if _qdrant_client is not None:
         return _qdrant_client
 
     settings = get_settings()
 
-    try:
-        # Try connecting to Qdrant server (Docker)
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.5, min=1, max=4),
+        retry=retry_if_exception_type(Exception),
+        reraise=False,
+    )
+    def _try_connect_server():
         client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port, timeout=5)
-        client.get_collections()  # Test connection
-        logger.info("Connected to Qdrant server at %s:%d", settings.qdrant_host, settings.qdrant_port)
-        _qdrant_client = client
-    except Exception:
-        # Fallback to in-memory mode for development
-        logger.warning("Qdrant server not available. Using in-memory mode (data will NOT persist).")
-        _qdrant_client = QdrantClient(":memory:")
+        client.get_collections()
+        return client
+
+    try:
+        # Try connecting to remote/docker Qdrant server
+        client = _try_connect_server()
+        if client:
+            logger.info("Connected to Qdrant server at %s:%d", settings.qdrant_host, settings.qdrant_port)
+            _qdrant_client = client
+            return _qdrant_client
+    except Exception as e:
+        logger.warning("Remote Qdrant server connection failed: %s", e)
+
+    # Fallback to local persistent disk storage (persists on disk rather than losing data in memory)
+    storage_path = str(settings.data_source_dir + "/../qdrant_local_storage")
+    logger.info("Using local persistent Qdrant storage at '%s'", storage_path)
+    _qdrant_client = QdrantClient(path=storage_path)
 
     return _qdrant_client
 
@@ -65,7 +89,7 @@ def get_reranker() -> Ranker:
     return _reranker
 
 
-def ensure_collection(dense_dim: int = 1024):
+def ensure_collection(dense_dim: int = 1024, force_recreate: bool = False):
     """
     Creates the Qdrant collection if it doesn't exist.
     Configured for hybrid search with both dense and sparse vectors.
@@ -76,8 +100,12 @@ def ensure_collection(dense_dim: int = 1024):
 
     collections = [c.name for c in client.get_collections().collections]
     if collection_name in collections:
-        logger.info("Collection '%s' already exists.", collection_name)
-        return
+        if force_recreate:
+            logger.info("Recreating collection '%s' to clear stale documents...", collection_name)
+            client.delete_collection(collection_name=collection_name)
+        else:
+            logger.info("Collection '%s' already exists.", collection_name)
+            return
 
     logger.info("Creating Qdrant collection '%s' (dense_dim=%d)...", collection_name, dense_dim)
 
@@ -93,13 +121,14 @@ def ensure_collection(dense_dim: int = 1024):
     logger.info("Collection '%s' created.", collection_name)
 
 
-def index_documents(chunks: list[dict], embeddings: dict):
+def index_documents(chunks: list[dict], embeddings: dict, force_recreate: bool = True):
     """
     Indexes document chunks into Qdrant with both dense and sparse vectors.
 
     Args:
         chunks: List of {'text': str, 'metadata': dict}
         embeddings: Dict with 'dense' (list[list[float]]) and 'sparse' (list[dict])
+        force_recreate: If True, wipes old points so deleted documents don't persist
     """
     settings = get_settings()
     client = get_qdrant_client()
@@ -107,7 +136,7 @@ def index_documents(chunks: list[dict], embeddings: dict):
 
     # Ensure collection exists with correct dimensions
     dense_dim = len(embeddings["dense"][0])
-    ensure_collection(dense_dim=dense_dim)
+    ensure_collection(dense_dim=dense_dim, force_recreate=force_recreate)
 
     logger.info("Indexing %d chunks into Qdrant...", len(chunks))
 
@@ -196,24 +225,28 @@ def hybrid_search(query_embedding: dict, top_k: int | None = None) -> list[dict]
     return search_results
 
 
-def rerank(query: str, search_results: list[dict], top_k: int | None = None) -> list[dict]:
+def rerank(
+    query: str,
+    search_results: list[dict],
+    top_k: int | None = None,
+    min_confidence: float | None = None,
+) -> list[dict]:
     """
-    Reranks search results using FlashRank cross-encoder for precision.
-
-    Two-stage retrieval:
-      Stage 1 (hybrid_search): High recall — retrieve many candidates
-      Stage 2 (rerank): High precision — reorder by relevance
+    Reranks search results using FlashRank cross-encoder for precision
+    and drops results below the confidence threshold to eliminate hallucinations.
 
     Args:
         query: The user's question
         search_results: Results from hybrid_search
         top_k: Number of reranked results to return
+        min_confidence: Minimum score threshold (defaults to settings.confidence_threshold)
 
     Returns:
-        Reranked list of {'text': str, 'metadata': dict, 'score': float}
+        Reranked list of {'text': str, 'metadata': dict, 'score': float} above threshold
     """
     settings = get_settings()
     k = top_k or settings.rerank_top_k
+    threshold = min_confidence if min_confidence is not None else settings.confidence_threshold
 
     if not search_results:
         return []
@@ -224,16 +257,27 @@ def rerank(query: str, search_results: list[dict], top_k: int | None = None) -> 
     passages = [{"id": i, "text": r["text"], "meta": r["metadata"]} for i, r in enumerate(search_results)]
     rerank_request = RerankRequest(query=query, passages=passages)
 
-    logger.info("Reranking %d candidates → top %d...", len(passages), k)
+    logger.info("Reranking %d candidates (threshold=%.2f)...", len(passages), threshold)
     reranked = ranker.rerank(rerank_request)
 
     results = []
-    for item in reranked[:k]:
-        results.append({
-            "text": item["text"],
-            "metadata": item["meta"],
-            "score": item["score"],
-        })
+    for item in reranked:
+        score = float(item.get("score", 0.0))
+        if score >= threshold:
+            results.append({
+                "text": item["text"],
+                "metadata": item["meta"],
+                "score": score,
+            })
+        else:
+            logger.debug("Filtered out low-confidence chunk (score %.4f < threshold %.2f)", score, threshold)
 
-    logger.info("Reranking complete. Top score: %.4f", results[0]["score"] if results else 0.0)
+        if len(results) >= k:
+            break
+
+    if results:
+        logger.info("Reranking complete. Returned %d high-confidence chunks. Top score: %.4f", len(results), results[0]["score"])
+    else:
+        logger.warning("No chunks met confidence threshold (%.2f) for query: '%s'", threshold, query[:80])
+
     return results
